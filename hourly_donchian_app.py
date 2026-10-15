@@ -5,33 +5,22 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Hourly Donchian + RSI(2) Engine", layout="wide")
+st.set_page_config(page_title="Hourly Donchian Close Engine", layout="wide")
 
-st.title("⚡ Hourly Donchian + Cumulative RSI(2) Platform")
+st.title("⚡ Hourly Donchian Close Breakout Platform")
 st.caption(
-    "Quantitative Hourly Trading Engine: Donchian Structural Boundaries + Cumulative RSI(2) Washout Timing. "
-    "Execution strictly on the close of 1-hour bars over the full 2-year maximum data window."
+    "Long-Only Trend System: Buy on X-Hour Highest Close, Exit on Y-Hour Lowest Close. "
+    "Execution strictly on the close of 1-hour bars (Max 2-Year Yahoo Dataset)."
 )
 
 # ==========================================
 # 1. DATA LOADER & INDICATOR CALCULATIONS
 # ==========================================
 
-def calculate_wilders_rsi(prices, period=2):
-    delta = prices.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(100)
-
 @st.cache_data(show_spinner=False)
 def fetch_hourly_data(symbol):
     """Pulls the maximum allowable 2 years (~730 days) of 1-hour bars with timezone normalization."""
     df = None
-    # 730d is Yahoo's hard ceiling; fallback to 728d if current intraday hour breaches boundary
     for p in ["730d", "728d", "720d"]:
         try:
             df = yf.download(symbol, period=p, interval="1h", auto_adjust=False, progress=False)
@@ -55,29 +44,26 @@ def fetch_hourly_data(symbol):
 
     return df.dropna()
 
-def prepare_hourly_indicators(df, donchian_window=20, trend_sma=100, rsi_smooth=3):
+def prepare_donchian_close_channels(df, entry_window=20, exit_window=10, trend_sma=0):
     df = df.copy()
 
-    # 1. Donchian Channels (Shifted by 1 to prevent lookahead bias)
-    df['Donchian_High'] = df['High'].shift(1).rolling(window=donchian_window).max()
-    df['Donchian_Low'] = df['Low'].shift(1).rolling(window=donchian_window).min()
-    df['Donchian_Mid'] = (df['Donchian_High'] + df['Donchian_Low']) / 2.0
+    # Shift by 1 bar to strictly avoid lookahead bias
+    df['Upper_Close'] = df['Close'].shift(1).rolling(window=entry_window).max()
+    df['Lower_Close'] = df['Close'].shift(1).rolling(window=exit_window).min()
+    df['Mid_Close'] = (df['Upper_Close'] + df['Lower_Close']) / 2.0
 
-    # 2. Macro Trend Filter
-    df['SMA_Trend'] = df['Close'].rolling(window=trend_sma).mean()
+    if trend_sma > 0:
+        df['SMA_Trend'] = df['Close'].rolling(window=trend_sma).mean()
+    else:
+        df['SMA_Trend'] = np.nan
 
-    # 3. Wilder's RSI(2) & Cumulative Rolling Smoothed RSI
-    df['RSI2'] = calculate_wilders_rsi(df['Close'], period=2)
-    df['CumRSI'] = df['RSI2'].rolling(window=rsi_smooth).mean()
-
-    return df.dropna()
+    return df.dropna(subset=['Upper_Close', 'Lower_Close'])
 
 # ==========================================
 # 2. BAR-CLOSE EXECUTION BACKTEST ENGINE
 # ==========================================
 
-def run_hourly_backtest(df, rsi_entry_thresh=15, exit_mode="Donchian Midline", 
-                       use_rsi_exit=True, max_hold_bars=21, init_cash=10000):
+def run_donchian_close_backtest(df, use_trend_filter=False, init_cash=10000):
     trades = []
     in_trade = False
 
@@ -89,43 +75,21 @@ def run_hourly_backtest(df, rsi_entry_thresh=15, exit_mode="Donchian Midline",
         current_bar = df.iloc[i]
         date = df.index[i]
         close = current_bar['Close']
+        upper = current_bar['Upper_Close']
+        lower = current_bar['Lower_Close']
 
         if in_trade:
             bars_held += 1
-            exit_hit = False
-            exit_reason = ""
 
-            # 1. Stop Loss: Close below Lower Donchian Band
-            if close < current_bar['Donchian_Low']:
-                exit_hit = True
-                exit_reason = "Stop: Donchian Low"
-
-            # 2. Target Exit
-            elif exit_mode == "Donchian Midline" and close >= current_bar['Donchian_Mid']:
-                exit_hit = True
-                exit_reason = "Target: Midline"
-            elif exit_mode == "Donchian Upper Band" and close >= current_bar['Donchian_High']:
-                exit_hit = True
-                exit_reason = "Target: Upper Band"
-
-            # 3. Momentum Snapback Exit
-            elif use_rsi_exit and current_bar['RSI2'] >= 70:
-                exit_hit = True
-                exit_reason = "Momentum: RSI(2) >= 70"
-
-            # 4. Time Stop
-            elif bars_held >= max_hold_bars:
-                exit_hit = True
-                exit_reason = f"Time Stop ({max_hold_bars}h)"
-
-            if exit_hit:
+            # Exit Rule: Hourly Close strictly breaks below the lowest close of prior Y hours
+            if close < lower:
                 trade_ret = (close - entry_price) / entry_price * 100
                 trades.append({
                     "Entry Date": entry_date.strftime('%Y-%m-%d %H:%M'),
                     "Entry Price": round(entry_price, 2),
                     "Exit Date": date.strftime('%Y-%m-%d %H:%M'),
                     "Exit Price": round(close, 2),
-                    "Exit Reason": exit_reason,
+                    "Exit Reason": "Lowest Close Breakdown",
                     "Return (%)": round(trade_ret, 2),
                     "Hours Held": bars_held,
                     "Result": "Win" if trade_ret > 0 else "Loss"
@@ -133,12 +97,14 @@ def run_hourly_backtest(df, rsi_entry_thresh=15, exit_mode="Donchian Midline",
                 in_trade = False
 
         if not in_trade:
-            # Entry Conditions (Evaluated at bar close)
-            is_uptrend = close > current_bar['SMA_Trend']
-            is_discounted = close < current_bar['Donchian_Mid']
-            is_oversold = current_bar['CumRSI'] <= rsi_entry_thresh
+            # Trend Filter Check
+            trend_passed = True
+            if use_trend_filter and not pd.isna(current_bar['SMA_Trend']):
+                if close <= current_bar['SMA_Trend']:
+                    trend_passed = False
 
-            if is_uptrend and is_discounted and is_oversold:
+            # Entry Rule: Hourly Close strictly breaks above the highest close of prior X hours
+            if close > upper and trend_passed:
                 in_trade = True
                 entry_price = close
                 entry_date = date
@@ -183,38 +149,40 @@ def run_hourly_backtest(df, rsi_entry_thresh=15, exit_mode="Donchian Midline",
     return trades_df, metrics, eq_series, drawdowns
 
 # ==========================================
-# 3. STREAMLIT INTERFACE
+# 3. STREAMLIT USER INTERFACE
 # ==========================================
 
-st.sidebar.header("1. Asset & Indicator Setup")
+st.sidebar.header("1. Asset & Timeframe")
 ticker = st.sidebar.text_input("Ticker Symbol", value="QQQ").upper().strip()
-donchian_n = st.sidebar.slider("Donchian Lookback (Hours)", min_value=10, max_value=50, value=20)
-trend_sma_n = st.sidebar.slider("Trend SMA Filter (Hours)", min_value=50, max_value=200, value=100)
-rsi_smooth_n = st.sidebar.slider("RSI(2) Smoothing Window", min_value=1, max_value=5, value=3)
 
-st.sidebar.header("2. Execution Rules")
-rsi_thresh = st.sidebar.number_input("CumRSI Entry Threshold", min_value=5.0, max_value=30.0, value=15.0, step=1.0)
-target_mode = st.sidebar.selectbox("Primary Profit Target", ["Donchian Midline", "Donchian Upper Band"])
-use_rsi_snap = st.sidebar.checkbox("Momentum Exit (RSI(2) >= 70)", value=True)
-max_hold = st.sidebar.number_input("Max Hold Time-Stop (Hours)", min_value=7, max_value=70, value=21, step=7)
+st.sidebar.header("2. Donchian Close Parameters")
+entry_window = st.sidebar.number_input("Entry Lookback (X Hours Highest Close)", min_value=2, max_value=200, value=20, step=1)
 
-chart_bars = st.sidebar.slider("Chart View Lookback (Recent Hours)", min_value=100, max_value=700, value=350, step=50)
+use_asymmetric_exit = st.sidebar.checkbox("Use Asymmetric Exit Lookback (Y Hours)", value=True, help="Classic Turtle/Donchian uses a shorter window to exit (e.g. 20h entry, 10h exit).")
+if use_asymmetric_exit:
+    exit_window = st.sidebar.number_input("Exit Lookback (Y Hours Lowest Close)", min_value=2, max_value=200, value=10, step=1)
+else:
+    exit_window = entry_window
 
-if st.sidebar.button("Run Hourly Simulation", type="primary", use_container_width=True):
-    with st.spinner(f"Downloading maximum 2-year hourly dataset for {ticker}..."):
+with st.sidebar.expander("⚙️ Optional Macro Trend Gate", expanded=False):
+    use_trend_filter = st.checkbox("Require Close > Trend SMA", value=False)
+    trend_sma = st.number_input("Trend SMA Lookback (Hours)", min_value=20, max_value=500, value=100, step=10) if use_trend_filter else 0
+
+chart_bars = st.sidebar.slider("Chart Lookback Window (Recent Hours)", min_value=100, max_value=800, value=350, step=50)
+
+if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_container_width=True):
+    with st.spinner(f"Downloading 2-year hourly dataset for {ticker}..."):
         raw_hourly = fetch_hourly_data(ticker)
 
-    if raw_hourly is None or len(raw_hourly) < trend_sma_n + 10:
+    if raw_hourly is None or len(raw_hourly) < max(entry_window, exit_window, trend_sma) + 10:
         st.error(f"Could not load sufficient hourly history for {ticker}.")
     else:
-        df_proc = prepare_hourly_indicators(raw_hourly, donchian_n, trend_sma_n, rsi_smooth_n)
-        trades_df, metrics, eq_series, dd_series = run_hourly_backtest(
-            df_proc, rsi_thresh, target_mode, use_rsi_snap, max_hold
-        )
+        df_proc = prepare_donchian_close_channels(raw_hourly, entry_window, exit_window, trend_sma)
+        trades_df, metrics, eq_series, dd_series = run_donchian_close_backtest(df_proc, use_trend_filter)
 
         st.info(
-            f"📅 **Backtest Sample Loaded:** **{metrics['Total Bars']:,} Hourly Bars** across the full 2-year data window "
-            f"(**{metrics['Start Date']}** to **{metrics['End Date']}**)."
+            f"📅 **Backtest Sample Scope:** **{metrics['Total Bars']:,} Hourly Bars** evaluated "
+            f"from **{metrics['Start Date']}** to **{metrics['End Date']}**."
         )
 
         # Performance Summary Cards
@@ -226,8 +194,8 @@ if st.sidebar.button("Run Hourly Simulation", type="primary", use_container_widt
         c5.metric("Profit Factor", f"{metrics['Profit Factor']}")
         c6.metric("Max Drawdown", f"{metrics['Max DD (%)']:.1f}%")
 
-        # --- Interactive Plotly Chart ---
-        st.subheader(f"📈 {ticker} Hourly Execution Chart (Last {chart_bars} Hours)")
+        # --- Interactive Execution Chart ---
+        st.subheader(f"📈 {ticker} Hourly Close Execution Chart (Last {chart_bars} Hours)")
         plot_df = df_proc.iloc[-chart_bars:]
 
         fig = go.Figure()
@@ -239,25 +207,42 @@ if st.sidebar.button("Run Hourly Simulation", type="primary", use_container_widt
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
         ))
 
-        # Donchian Bands
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Donchian_High'], mode='lines', 
-                                 line=dict(color='rgba(0, 229, 255, 0.5)', width=1), name="Donchian Upper"))
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Donchian_Mid'], mode='lines', 
-                                 line=dict(color='rgba(255, 255, 255, 0.4)', width=1, dash='dot'), name="Midline"))
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Donchian_Low'], mode='lines', 
-                                 line=dict(color='rgba(255, 82, 82, 0.5)', width=1), name="Donchian Lower"))
+        # Upper Donchian Close Line
+        fig.add_trace(go.Scatter(
+            x=plot_df.index, y=plot_df['Upper_Close'], mode='lines',
+            line=dict(color='#00E5FF', width=1.5),
+            name=f"Upper Close ({entry_window}h Highest Close)"
+        ))
 
-        # Trend SMA
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['SMA_Trend'], mode='lines', 
-                                 line=dict(color='#FFD700', width=1.5), name=f"{trend_sma_n}H SMA Trend"))
+        # Lower Donchian Close Line
+        fig.add_trace(go.Scatter(
+            x=plot_df.index, y=plot_df['Lower_Close'], mode='lines',
+            line=dict(color='#FF5252', width=1.5),
+            name=f"Lower Close ({exit_window}h Lowest Close)"
+        ))
 
-        # Render Trades that fall within this recent window
+        # Midline
+        fig.add_trace(go.Scatter(
+            x=plot_df.index, y=plot_df['Mid_Close'], mode='lines',
+            line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'),
+            name="Midline"
+        ))
+
+        # Optional Trend SMA
+        if use_trend_filter and 'SMA_Trend' in plot_df.columns:
+            fig.add_trace(go.Scatter(
+                x=plot_df.index, y=plot_df['SMA_Trend'], mode='lines',
+                line=dict(color='#FFD700', width=1.5),
+                name=f"{trend_sma}h Trend SMA"
+            ))
+
+        # Trade Markers
         if not trades_df.empty:
             entry_dts = pd.to_datetime(trades_df['Entry Date'])
             recent_trades = trades_df[entry_dts >= plot_df.index[0]]
 
             if not recent_trades.empty:
-                # Trade Vectors
+                # Trade Vectors (Entry to Exit connecting line)
                 for _, tr in recent_trades.iterrows():
                     vec_col = 'rgba(0, 255, 102, 0.6)' if tr['Result'] == 'Win' else 'rgba(255, 51, 102, 0.6)'
                     fig.add_trace(go.Scatter(
@@ -269,16 +254,16 @@ if st.sidebar.button("Run Hourly Simulation", type="primary", use_container_widt
                         hoverinfo='skip'
                     ))
 
-                # Entry Markers
+                # Entry Marker
                 fig.add_trace(go.Scatter(
                     x=pd.to_datetime(recent_trades['Entry Date']), y=recent_trades['Entry Price'],
                     mode='markers', name='Entry (Bar Close)',
                     marker=dict(symbol='triangle-up', size=11, color='#00FF66', line=dict(color='white', width=1)),
-                    hovertext=[f"Buy: ${p:.2f}<br>{d}" for p, d in zip(recent_trades['Entry Price'], recent_trades['Entry Date'])],
+                    hovertext=[f"Long Entry: ${p:.2f}<br>{d}" for p, d in zip(recent_trades['Entry Price'], recent_trades['Entry Date'])],
                     hoverinfo='text'
                 ))
 
-                # Exit Markers
+                # Exit Marker
                 fig.add_trace(go.Scatter(
                     x=pd.to_datetime(recent_trades['Exit Date']), y=recent_trades['Exit Price'],
                     mode='markers', name='Exit (Bar Close)',
@@ -291,17 +276,17 @@ if st.sidebar.button("Run Hourly Simulation", type="primary", use_container_widt
                           margin=dict(l=20, r=20, t=30, b=20), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Equity Curve & Drawdown
+        # Equity Curve & Drawdown Charts
         col_eq1, col_eq2 = st.columns(2)
         with col_eq1:
             fig_eq = go.Figure()
             fig_eq.add_trace(go.Scatter(x=eq_series.index, y=eq_series.values, mode='lines', line=dict(color='#00FF66')))
-            fig_eq.update_layout(title="Equity Compounding ($)", template="plotly_dark", height=320, margin=dict(l=20, r=20, t=40, b=20))
+            fig_eq.update_layout(title="Compounded Account Equity ($)", template="plotly_dark", height=320, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_eq, use_container_width=True)
         with col_eq2:
             fig_dd = go.Figure()
             fig_dd.add_trace(go.Scatter(x=dd_series.index, y=dd_series.values * 100, fill='tozeroy', mode='lines', line=dict(color='#FF3366')))
-            fig_dd.update_layout(title="Drawdown Profile (%)", template="plotly_dark", height=320, margin=dict(l=20, r=20, t=40, b=20))
+            fig_dd.update_layout(title="Peak-to-Trough Drawdown (%)", template="plotly_dark", height=320, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_dd, use_container_width=True)
 
         # Trade Log Table
