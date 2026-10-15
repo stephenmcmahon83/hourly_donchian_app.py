@@ -5,11 +5,11 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Hourly Donchian Close Engine", layout="wide")
+st.set_page_config(page_title="Hourly Mean-Reversion Donchian Engine", layout="wide")
 
-st.title("⚡ Hourly Donchian Close Breakout Platform")
+st.title("⚡ Hourly Mean-Reversion Donchian Close Platform")
 st.caption(
-    "Long-Only Trend System: Buy on X-Hour Highest Close, Exit on Y-Hour Lowest Close. "
+    "Long-Only Mean-Reversion Engine: Buy X-Hour Lowest Close (Dip Flush), Sell Y-Hour Highest Close (Snapback Bounce). "
     "Execution strictly on the close of 1-hour bars (Max 2-Year Yahoo Dataset)."
 )
 
@@ -44,26 +44,25 @@ def fetch_hourly_data(symbol):
 
     return df.dropna()
 
-def prepare_donchian_close_channels(df, entry_window=20, exit_window=10, trend_sma=0):
+def prepare_reversed_donchian_channels(df, entry_window=20, exit_window=5, trend_sma=0):
     df = df.copy()
 
-    # Shift by 1 bar to strictly avoid lookahead bias
-    df['Upper_Close'] = df['Close'].shift(1).rolling(window=entry_window).max()
-    df['Lower_Close'] = df['Close'].shift(1).rolling(window=exit_window).min()
-    df['Mid_Close'] = (df['Upper_Close'] + df['Lower_Close']) / 2.0
+    # Shift by 1 bar to strictly eliminate lookahead bias
+    df['Entry_Lower_Close'] = df['Close'].shift(1).rolling(window=entry_window).min()
+    df['Exit_Upper_Close'] = df['Close'].shift(1).rolling(window=exit_window).max()
 
     if trend_sma > 0:
         df['SMA_Trend'] = df['Close'].rolling(window=trend_sma).mean()
     else:
         df['SMA_Trend'] = np.nan
 
-    return df.dropna(subset=['Upper_Close', 'Lower_Close'])
+    return df.dropna(subset=['Entry_Lower_Close', 'Exit_Upper_Close'])
 
 # ==========================================
 # 2. BAR-CLOSE EXECUTION BACKTEST ENGINE
 # ==========================================
 
-def run_donchian_close_backtest(df, use_trend_filter=False, init_cash=10000):
+def run_reversed_donchian_backtest(df, use_trend_filter=False, max_hold_bars=0, stop_loss_pct=0.0, init_cash=10000):
     trades = []
     in_trade = False
 
@@ -75,21 +74,37 @@ def run_donchian_close_backtest(df, use_trend_filter=False, init_cash=10000):
         current_bar = df.iloc[i]
         date = df.index[i]
         close = current_bar['Close']
-        upper = current_bar['Upper_Close']
-        lower = current_bar['Lower_Close']
+        entry_trigger = current_bar['Entry_Lower_Close']
+        exit_trigger = current_bar['Exit_Upper_Close']
 
         if in_trade:
             bars_held += 1
+            exit_hit = False
+            exit_reason = ""
 
-            # Exit Rule: Hourly Close strictly breaks below the lowest close of prior Y hours
-            if close < lower:
+            # 1. Primary Exit: Hourly Close prints above prior Y-hour highest close
+            if close > exit_trigger:
+                exit_hit = True
+                exit_reason = "Highest Close Target"
+
+            # 2. Optional Emergency Stop Loss (% Drawdown)
+            elif stop_loss_pct > 0 and (close - entry_price) / entry_price * 100 <= -stop_loss_pct:
+                exit_hit = True
+                exit_reason = f"Stop Loss (-{stop_loss_pct:.1f}%)"
+
+            # 3. Optional Time Stop (Max Holding Bars)
+            elif max_hold_bars > 0 and bars_held >= max_hold_bars:
+                exit_hit = True
+                exit_reason = f"Time Stop ({max_hold_bars}h)"
+
+            if exit_hit:
                 trade_ret = (close - entry_price) / entry_price * 100
                 trades.append({
                     "Entry Date": entry_date.strftime('%Y-%m-%d %H:%M'),
                     "Entry Price": round(entry_price, 2),
                     "Exit Date": date.strftime('%Y-%m-%d %H:%M'),
                     "Exit Price": round(close, 2),
-                    "Exit Reason": "Lowest Close Breakdown",
+                    "Exit Reason": exit_reason,
                     "Return (%)": round(trade_ret, 2),
                     "Hours Held": bars_held,
                     "Result": "Win" if trade_ret > 0 else "Loss"
@@ -103,8 +118,8 @@ def run_donchian_close_backtest(df, use_trend_filter=False, init_cash=10000):
                 if close <= current_bar['SMA_Trend']:
                     trend_passed = False
 
-            # Entry Rule: Hourly Close strictly breaks above the highest close of prior X hours
-            if close > upper and trend_passed:
+            # Reversed Entry Rule: Buy when close flushes below prior X-hour lowest close
+            if close < entry_trigger and trend_passed:
                 in_trade = True
                 entry_price = close
                 entry_date = date
@@ -152,33 +167,49 @@ def run_donchian_close_backtest(df, use_trend_filter=False, init_cash=10000):
 # 3. STREAMLIT USER INTERFACE
 # ==========================================
 
-st.sidebar.header("1. Asset & Timeframe")
+st.sidebar.header("1. Asset & Lookback")
 ticker = st.sidebar.text_input("Ticker Symbol", value="QQQ").upper().strip()
 
-st.sidebar.header("2. Donchian Close Parameters")
-entry_window = st.sidebar.number_input("Entry Lookback (X Hours Highest Close)", min_value=2, max_value=200, value=20, step=1)
+st.sidebar.header("2. Mean-Reversion Close Channels")
+entry_window = st.sidebar.number_input(
+    "Entry Lookback: X-Hour Lowest Close", 
+    min_value=2, max_value=200, value=20, step=1,
+    help="Triggers a Long Buy when the hourly close drops below the lowest close of the prior X hours."
+)
 
-use_asymmetric_exit = st.sidebar.checkbox("Use Asymmetric Exit Lookback (Y Hours)", value=True, help="Classic Turtle/Donchian uses a shorter window to exit (e.g. 20h entry, 10h exit).")
-if use_asymmetric_exit:
-    exit_window = st.sidebar.number_input("Exit Lookback (Y Hours Lowest Close)", min_value=2, max_value=200, value=10, step=1)
-else:
-    exit_window = entry_window
+exit_window = st.sidebar.number_input(
+    "Exit Lookback: Y-Hour Highest Close", 
+    min_value=2, max_value=200, value=5, step=1,
+    help="Triggers an Exit when the hourly close pushes above the highest close of the prior Y hours."
+)
 
-with st.sidebar.expander("⚙️ Optional Macro Trend Gate", expanded=False):
-    use_trend_filter = st.checkbox("Require Close > Trend SMA", value=False)
-    trend_sma = st.number_input("Trend SMA Lookback (Hours)", min_value=20, max_value=500, value=100, step=10) if use_trend_filter else 0
+with st.sidebar.expander("⚙️ Advanced Risk & Trend Filters", expanded=True):
+    use_trend_filter = st.checkbox(
+        "Require Close > Trend SMA (Bull Filter)", 
+        value=True, 
+        help="Only buy washouts when the stock is in an overall secular uptrend."
+    )
+    trend_sma = st.number_input("Trend SMA Lookback (Hours)", min_value=20, max_value=500, value=150, step=10) if use_trend_filter else 0
 
-chart_bars = st.sidebar.slider("Chart Lookback Window (Recent Hours)", min_value=100, max_value=800, value=350, step=50)
+    use_stop_loss = st.checkbox("Enable Protective Stop-Loss (%)", value=False)
+    stop_loss_pct = st.number_input("Stop Loss Percentage", min_value=0.5, max_value=20.0, value=3.0, step=0.5) if use_stop_loss else 0.0
 
-if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_container_width=True):
+    use_time_stop = st.checkbox("Enable Max Hold Time-Stop", value=False)
+    max_hold_bars = st.number_input("Max Hold Duration (Hours)", min_value=7, max_value=150, value=35, step=7) if use_time_stop else 0
+
+chart_bars = st.sidebar.slider("Chart View (Recent Hours)", min_value=100, max_value=800, value=350, step=50)
+
+if st.sidebar.button("Run Reversed Donchian Simulation", type="primary", use_container_width=True):
     with st.spinner(f"Downloading 2-year hourly dataset for {ticker}..."):
         raw_hourly = fetch_hourly_data(ticker)
 
     if raw_hourly is None or len(raw_hourly) < max(entry_window, exit_window, trend_sma) + 10:
         st.error(f"Could not load sufficient hourly history for {ticker}.")
     else:
-        df_proc = prepare_donchian_close_channels(raw_hourly, entry_window, exit_window, trend_sma)
-        trades_df, metrics, eq_series, dd_series = run_donchian_close_backtest(df_proc, use_trend_filter)
+        df_proc = prepare_reversed_donchian_channels(raw_hourly, entry_window, exit_window, trend_sma)
+        trades_df, metrics, eq_series, dd_series = run_reversed_donchian_backtest(
+            df_proc, use_trend_filter, max_hold_bars, stop_loss_pct
+        )
 
         st.info(
             f"📅 **Backtest Sample Scope:** **{metrics['Total Bars']:,} Hourly Bars** evaluated "
@@ -195,7 +226,7 @@ if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_contai
         c6.metric("Max Drawdown", f"{metrics['Max DD (%)']:.1f}%")
 
         # --- Interactive Execution Chart ---
-        st.subheader(f"📈 {ticker} Hourly Close Execution Chart (Last {chart_bars} Hours)")
+        st.subheader(f"📈 {ticker} Mean-Reversion Execution Chart (Last {chart_bars} Hours)")
         plot_df = df_proc.iloc[-chart_bars:]
 
         fig = go.Figure()
@@ -207,28 +238,21 @@ if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_contai
             increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
         ))
 
-        # Upper Donchian Close Line
+        # Entry Trigger Line: Lowest Close
         fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['Upper_Close'], mode='lines',
+            x=plot_df.index, y=plot_df['Entry_Lower_Close'], mode='lines',
             line=dict(color='#00E5FF', width=1.5),
-            name=f"Upper Close ({entry_window}h Highest Close)"
+            name=f"Entry Trigger ({entry_window}h Lowest Close)"
         ))
 
-        # Lower Donchian Close Line
+        # Exit Target Line: Highest Close
         fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['Lower_Close'], mode='lines',
-            line=dict(color='#FF5252', width=1.5),
-            name=f"Lower Close ({exit_window}h Lowest Close)"
+            x=plot_df.index, y=plot_df['Exit_Upper_Close'], mode='lines',
+            line=dict(color='#FFA726', width=1.5, dash='dash'),
+            name=f"Exit Target ({exit_window}h Highest Close)"
         ))
 
-        # Midline
-        fig.add_trace(go.Scatter(
-            x=plot_df.index, y=plot_df['Mid_Close'], mode='lines',
-            line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'),
-            name="Midline"
-        ))
-
-        # Optional Trend SMA
+        # Trend SMA
         if use_trend_filter and 'SMA_Trend' in plot_df.columns:
             fig.add_trace(go.Scatter(
                 x=plot_df.index, y=plot_df['SMA_Trend'], mode='lines',
@@ -236,15 +260,15 @@ if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_contai
                 name=f"{trend_sma}h Trend SMA"
             ))
 
-        # Trade Markers
+        # Render Trades
         if not trades_df.empty:
             entry_dts = pd.to_datetime(trades_df['Entry Date'])
             recent_trades = trades_df[entry_dts >= plot_df.index[0]]
 
             if not recent_trades.empty:
-                # Trade Vectors (Entry to Exit connecting line)
+                # Trade Vectors (Connecting Entry to Exit)
                 for _, tr in recent_trades.iterrows():
-                    vec_col = 'rgba(0, 255, 102, 0.6)' if tr['Result'] == 'Win' else 'rgba(255, 51, 102, 0.6)'
+                    vec_col = 'rgba(0, 255, 102, 0.7)' if tr['Result'] == 'Win' else 'rgba(255, 51, 102, 0.7)'
                     fig.add_trace(go.Scatter(
                         x=[pd.to_datetime(tr['Entry Date']), pd.to_datetime(tr['Exit Date'])],
                         y=[tr['Entry Price'], tr['Exit Price']],
@@ -254,19 +278,19 @@ if st.sidebar.button("Run Donchian Close Simulation", type="primary", use_contai
                         hoverinfo='skip'
                     ))
 
-                # Entry Marker
+                # Entry Markers (Long Buy at the flush)
                 fig.add_trace(go.Scatter(
                     x=pd.to_datetime(recent_trades['Entry Date']), y=recent_trades['Entry Price'],
-                    mode='markers', name='Entry (Bar Close)',
+                    mode='markers', name='Buy (Washout Close)',
                     marker=dict(symbol='triangle-up', size=11, color='#00FF66', line=dict(color='white', width=1)),
-                    hovertext=[f"Long Entry: ${p:.2f}<br>{d}" for p, d in zip(recent_trades['Entry Price'], recent_trades['Entry Date'])],
+                    hovertext=[f"Buy Washout: ${p:.2f}<br>{d}" for p, d in zip(recent_trades['Entry Price'], recent_trades['Entry Date'])],
                     hoverinfo='text'
                 ))
 
-                # Exit Marker
+                # Exit Markers (Sell into strength)
                 fig.add_trace(go.Scatter(
                     x=pd.to_datetime(recent_trades['Exit Date']), y=recent_trades['Exit Price'],
-                    mode='markers', name='Exit (Bar Close)',
+                    mode='markers', name='Sell (Bounce Close)',
                     marker=dict(symbol='triangle-down', size=11, color='#FF3366', line=dict(color='white', width=1)),
                     hovertext=[f"Exit: ${p:.2f}<br>{r} ({ret:+.2f}%)" for p, r, ret in zip(recent_trades['Exit Price'], recent_trades['Exit Reason'], recent_trades['Return (%)'])],
                     hoverinfo='text'
